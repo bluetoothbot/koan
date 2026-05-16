@@ -4,7 +4,11 @@ Tests _run_git, truncate_text, _rebase_onto_target, run_claude,
 commit_if_changes, and run_claude_step.
 """
 
+import os
 import subprocess
+import sys
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -400,14 +404,150 @@ class TestPrefetchAllRemotes:
 # ---------- run_claude ----------
 
 
+class TestRunClaudeStreamsOutput:
+    """run_claude must stream child stdout in real time so the parent's
+    liveness watchdog (run.py's 600s no-output kill, see #1660 aioesphomeapi
+    stagnation) sees ongoing activity. Silent ``capture_output=True`` causes
+    the wrapping skill subprocess to appear stuck even when Claude is
+    actively producing JSON output.
+    """
+
+    def test_streams_each_stdout_line_in_real_time(self, tmp_path):
+        """Lines from the child must reach parent stdout as produced, not
+        buffered until exit. Captured arrival timestamps prove streaming.
+        """
+        script = tmp_path / "tick.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            "echo TICK1\n"
+            "sleep 0.4\n"
+            "echo TICK2\n"
+            "sleep 0.4\n"
+            "echo TICK3\n"
+        )
+        script.chmod(0o755)
+
+        arrivals: list[tuple[str, float]] = []
+        start = time.time()
+        real_write = sys.stdout.write
+
+        def recording_write(s):
+            for tag in ("TICK1", "TICK2", "TICK3"):
+                if tag in s:
+                    arrivals.append((tag, time.time() - start))
+            return real_write(s)
+
+        with patch.object(sys.stdout, "write", side_effect=recording_write):
+            result = run_claude(
+                ["/bin/bash", str(script)], str(tmp_path), timeout=10,
+            )
+
+        assert result["success"] is True
+        seen_tags = [t for t, _ in arrivals]
+        assert seen_tags == ["TICK1", "TICK2", "TICK3"], (
+            f"Expected streaming TICK1/2/3 to stdout, got: {arrivals}"
+        )
+        t1 = next(t for tag, t in arrivals if tag == "TICK1")
+        t2 = next(t for tag, t in arrivals if tag == "TICK2")
+        assert (t2 - t1) > 0.3, (
+            f"TICK2 arrived only {(t2-t1)*1000:.0f}ms after TICK1 — "
+            f"likely buffered, not streamed"
+        )
+
+    def test_collected_output_still_available_in_return(self, tmp_path):
+        """Streaming must not break the contract: result['output'] still
+        holds the full captured text.
+        """
+        script = tmp_path / "out.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            "echo line-a\n"
+            "echo line-b\n"
+        )
+        script.chmod(0o755)
+
+        result = run_claude(
+            ["/bin/bash", str(script)], str(tmp_path), timeout=10,
+        )
+
+        assert result["success"] is True
+        assert "line-a" in result["output"]
+        assert "line-b" in result["output"]
+
+    def test_timeout_kills_process_group(self, tmp_path):
+        """On timeout, the entire process group must be killed — backgrounded
+        grandchildren cannot survive past run_claude's return.
+        """
+        script = tmp_path / "spawner.sh"
+        marker = tmp_path / "alive"
+        script.write_text(
+            "#!/bin/bash\n"
+            f"( sleep 5; echo grandchild-finished > {marker} ) &\n"
+            "echo spawned-grandchild\n"
+            "sleep 30\n"
+        )
+        script.chmod(0o755)
+
+        start = time.time()
+        result = run_claude(
+            ["/bin/bash", str(script)], str(tmp_path), timeout=2,
+        )
+        elapsed = time.time() - start
+
+        assert result["success"] is False
+        assert elapsed < 6, (
+            f"run_claude blocked for {elapsed:.1f}s — timeout not honored"
+        )
+        # Sleep past the grandchild's own sleep to confirm it died.
+        time.sleep(5)
+        assert not marker.exists(), (
+            "Grandchild survived timeout — process group was not killed"
+        )
+
+    def test_timeout_returns_before_grandchild_dies(self, tmp_path):
+        """run_claude must return within ~timeout even if a grandchild
+        inherits the stdout pipe and would otherwise block parent .wait().
+        """
+        # Shell script that spawns a backgrounded grandchild which inherits
+        # stdout (no redirection), then the foreground sleeps. The grandchild
+        # keeps the pipe open after the foreground is SIGKILLed, which causes
+        # subprocess.run(capture_output=True) to hang in pipe drain.
+        script = tmp_path / "spawner.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            "sleep 30 &\n"  # grandchild holds stdout open
+            "sleep 30\n"    # foreground process to wait for
+        )
+        script.chmod(0o755)
+
+        start = time.time()
+        # Invoke via bash so the test works on tmpfs mounted noexec.
+        result = run_claude(["/bin/bash", str(script)], str(tmp_path), timeout=2)
+        elapsed = time.time() - start
+
+        assert result["success"] is False
+        assert "Timeout" in result["error"] or "timed out" in result["error"].lower()
+        # Allow generous slack for cleanup, but must NOT wait for the
+        # grandchild's full 30s sleep. With process-group kill this completes
+        # in ~2-3s; without it, hangs until grandchild exits.
+        assert elapsed < 10, (
+            f"run_claude blocked for {elapsed:.1f}s when timeout=2s — "
+            f"process group not killed (grandchildren held stdout pipe)"
+        )
+
+
 class TestRunClaude:
     """Tests for run_claude — CLI invocation wrapper."""
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_success(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="  done  \n", stderr=""
-        )
+    @patch("app.claude_step.popen_cli")
+    def test_success(self, mock_popen):
+        proc = MagicMock()
+        proc.stdout = iter(["  done  \n"])
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = ""
+        proc.wait.return_value = 0
+        proc.returncode = 0
+        mock_popen.return_value = (proc, lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is True
         assert result["output"] == "done"
