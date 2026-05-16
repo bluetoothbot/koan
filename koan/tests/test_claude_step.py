@@ -7,6 +7,7 @@ commit_if_changes, and run_claude_step.
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -539,46 +540,55 @@ class TestRunClaudeStreamsOutput:
 class TestRunClaude:
     """Tests for run_claude — CLI invocation wrapper."""
 
+    @staticmethod
+    def _fake_proc(stdout_lines, stderr_text="", returncode=0):
+        proc = MagicMock()
+        proc.stdout = iter(stdout_lines)
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = stderr_text
+        proc.wait.return_value = returncode
+        proc.returncode = returncode
+        return proc
+
     @patch("app.claude_step.popen_cli")
     def test_success(self, mock_popen):
-        proc = MagicMock()
-        proc.stdout = iter(["  done  \n"])
-        proc.stderr = MagicMock()
-        proc.stderr.read.return_value = ""
-        proc.wait.return_value = 0
-        proc.returncode = 0
-        mock_popen.return_value = (proc, lambda: None)
+        mock_popen.return_value = (self._fake_proc(["  done  \n"]), lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is True
         assert result["output"] == "done"
         assert result["error"] == ""
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_failure_with_stderr(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="partial", stderr="something broke"
+    @patch("app.claude_step.popen_cli")
+    def test_failure_with_stderr(self, mock_popen):
+        mock_popen.return_value = (
+            self._fake_proc(["partial\n"], stderr_text="something broke", returncode=1),
+            lambda: None,
         )
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is False
         assert "Exit code 1" in result["error"]
         assert "something broke" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_failure_no_stderr(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr=""
+    @patch("app.claude_step.popen_cli")
+    def test_failure_no_stderr(self, mock_popen):
+        mock_popen.return_value = (
+            self._fake_proc([], stderr_text="", returncode=1),
+            lambda: None,
         )
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is False
         assert "no stderr" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_failure_no_stderr_includes_stdout(self, mock_run):
+    @patch("app.claude_step.popen_cli")
+    def test_failure_no_stderr_includes_stdout(self, mock_popen):
         """When stderr is empty but stdout has content, error includes stdout."""
-        mock_run.return_value = MagicMock(
-            returncode=1,
-            stdout="Error: context window exceeded",
-            stderr="",
+        mock_popen.return_value = (
+            self._fake_proc(
+                ["Error: context window exceeded\n"],
+                stderr_text="",
+                returncode=1,
+            ),
+            lambda: None,
         )
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is False
@@ -586,31 +596,57 @@ class TestRunClaude:
         assert "stdout:" in result["error"]
         assert "context window exceeded" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_timeout(self, mock_run):
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=600)
-        result = run_claude(["claude", "-p", "test"], "/project")
+    @patch("app.claude_step.popen_cli")
+    def test_timeout_returns_error(self, mock_popen):
+        """When the watchdog fires (timed_out flag set), result reports the
+        configured timeout value in the error message.
+        """
+        # A hanging stdout iterator simulates Claude producing no output;
+        # the watchdog timer fires and kills the (mock) process.
+        proc = MagicMock()
+        kill_event = threading.Event()
+
+        def hanging_iter():
+            # Block until kill_event is set by the watchdog-emulating kill
+            kill_event.wait(timeout=2)
+            return
+            yield  # unreachable, makes this a generator
+
+        proc.stdout = hanging_iter()
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = ""
+        proc.wait.return_value = -9
+        proc.returncode = -9
+        proc.kill.side_effect = lambda: kill_event.set()
+        proc.pid = os.getpid()  # so getpgid succeeds
+        mock_popen.return_value = (proc, lambda: None)
+
+        # Patch os.killpg to release the hanging iterator
+        with patch("app.claude_step.os.killpg", side_effect=lambda *a: kill_event.set()):
+            result = run_claude(["claude", "-p", "test"], "/project", timeout=1)
+
         assert result["success"] is False
         assert "Timeout" in result["error"]
-        assert "600" in result["error"]
+        assert "1" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_custom_timeout(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-        run_claude(["claude", "-p", "test"], "/project", timeout=120)
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["timeout"] == 120
-        assert call_kwargs["cwd"] == "/project"
-
-    @patch("app.cli_exec.subprocess.run")
-    def test_long_stderr_truncated(self, mock_run):
+    @patch("app.claude_step.popen_cli")
+    def test_long_stderr_truncated(self, mock_popen):
         long_err = "E" * 1000
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr=long_err
+        mock_popen.return_value = (
+            self._fake_proc([], stderr_text=long_err, returncode=1),
+            lambda: None,
         )
         result = run_claude(["claude", "-p", "test"], "/project")
         # Should only keep last 500 chars of stderr
         assert len(result["error"]) < 600
+
+    @patch("app.claude_step.popen_cli")
+    def test_passes_cwd_to_popen(self, mock_popen):
+        mock_popen.return_value = (self._fake_proc([]), lambda: None)
+        run_claude(["claude", "-p", "test"], "/project", timeout=120)
+        call_kwargs = mock_popen.call_args[1]
+        assert call_kwargs["cwd"] == "/project"
+        assert call_kwargs["start_new_session"] is True
 
 
 # ---------- commit_if_changes ----------

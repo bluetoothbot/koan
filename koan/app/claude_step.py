@@ -8,13 +8,18 @@ pipeline modules.
 
 import json
 import logging
+import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+
+from app.cli_exec import popen_cli
 
 
 class StepResult:
@@ -223,60 +228,141 @@ def strip_cli_noise(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _kill_pgroup(proc: subprocess.Popen) -> None:
+    """Kill the entire process group of *proc* with SIGKILL.
+
+    Required to clean up grandchildren spawned by ``claude`` (MCP servers,
+    hooks). Without this, the immediate child dies but backgrounded
+    grandchildren survive and can hold inherited pipes open.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as e:
+        print(f"[claude_step] killpg failed, falling back to proc.kill(): {e}", file=sys.stderr)
+        try:
+            proc.kill()
+        except Exception as kill_err:
+            print(f"[claude_step] proc.kill() also failed: {kill_err}", file=sys.stderr)
+
+
 def run_claude(cmd: list, cwd: str, timeout: int = 600) -> dict:
-    """Run a Claude Code CLI command.
+    """Run a Claude Code CLI command, streaming stdout in real time.
+
+    Streams each stdout line to the parent's stdout as it arrives so any
+    outer liveness watchdog (e.g. run.py's first_output_timeout) sees
+    activity. Spawns the child in a new session and kills the entire
+    process group on timeout to reclaim grandchildren.
 
     Returns:
         Dict with keys: success (bool), output (str), error (str).
     """
-    from app.cli_exec import run_cli_with_retry
-
     from app.security_audit import SUBPROCESS_EXEC, _redact_list, log_event
 
+    proc = None
+    cleanup = lambda: None  # noqa: E731
+    timed_out = False
+    stdout_lines: list[str] = []
+    stderr_text = ""
+
+    def _watchdog():
+        nonlocal timed_out
+        timed_out = True
+        if proc is not None:
+            _kill_pgroup(proc)
+
+    timer: Optional[threading.Timer] = None
     try:
-        result = run_cli_with_retry(
+        proc, cleanup = popen_cli(
             cmd,
-            capture_output=True, text=True,
-            timeout=timeout, cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            start_new_session=True,
         )
-        if result.returncode != 0:
-            stderr_snippet = result.stderr[-500:] if result.stderr else "no stderr"
-            # When stderr is empty, stdout often contains the actual error
-            # (e.g. "Error: context window exceeded").  Include it so callers
-            # get actionable diagnostics instead of just "no stderr".
-            stdout_text = result.stdout.strip()
-            if not result.stderr and stdout_text:
-                stderr_snippet = f"no stderr | stdout: {stdout_text[-500:]}"
-            log_event(SUBPROCESS_EXEC, details={
-                "cmd": _redact_list(cmd),
-                "cwd": cwd,
-                "exit_code": result.returncode,
-            }, result="failure")
-            return {
-                "success": False,
-                "output": stdout_text,
-                "error": f"Exit code {result.returncode}: {stderr_snippet}",
-            }
-        log_event(SUBPROCESS_EXEC, details={
-            "cmd": _redact_list(cmd),
-            "cwd": cwd,
-            "exit_code": 0,
-        })
-        return {
-            "success": True,
-            "output": result.stdout.strip(),
-            "error": "",
-        }
-    except subprocess.TimeoutExpired:
+
+        if timeout and timeout > 0:
+            timer = threading.Timer(timeout, _watchdog)
+            timer.daemon = True
+            timer.start()
+
+        try:
+            for line in proc.stdout:
+                stripped = line.rstrip("\n")
+                stdout_lines.append(stripped)
+                print(stripped, flush=True)
+        finally:
+            if proc.stderr is not None:
+                try:
+                    stderr_text = proc.stderr.read() or ""
+                except Exception as e:
+                    print(f"[claude_step] reading stderr failed: {e}", file=sys.stderr)
+                    stderr_text = ""
+
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_pgroup(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if proc is not None:
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except Exception as e:
+                print(f"[claude_step] closing stdout failed: {e}", file=sys.stderr)
+            try:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+            except Exception as e:
+                print(f"[claude_step] closing stderr failed: {e}", file=sys.stderr)
+        cleanup()
+
+    stdout_text = "\n".join(stdout_lines).strip()
+
+    if timed_out:
         log_event(SUBPROCESS_EXEC, details={
             "cmd": _redact_list(cmd),
             "cwd": cwd,
         }, result="timeout")
         return {
             "success": False,
-            "output": "",
+            "output": stdout_text,
             "error": f"Timeout ({timeout}s)",
         }
+
+    rc = proc.returncode if proc is not None else 1
+    if rc != 0:
+        stderr_snippet = stderr_text[-500:] if stderr_text else "no stderr"
+        if not stderr_text and stdout_text:
+            stderr_snippet = f"no stderr | stdout: {stdout_text[-500:]}"
+        log_event(SUBPROCESS_EXEC, details={
+            "cmd": _redact_list(cmd),
+            "cwd": cwd,
+            "exit_code": rc,
+        }, result="failure")
+        return {
+            "success": False,
+            "output": stdout_text,
+            "error": f"Exit code {rc}: {stderr_snippet}",
+        }
+
+    log_event(SUBPROCESS_EXEC, details={
+        "cmd": _redact_list(cmd),
+        "cwd": cwd,
+        "exit_code": 0,
+    })
+    return {
+        "success": True,
+        "output": stdout_text,
+        "error": "",
+    }
 
 
 def commit_if_changes(project_path: str, message: str) -> bool:

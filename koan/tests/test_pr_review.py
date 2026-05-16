@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
@@ -297,28 +298,58 @@ class TestCommitIfChanges:
 # ---------------------------------------------------------------------------
 
 class TestRunClaude:
-    @patch("app.claude_step.subprocess.run")
-    def test_success(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="Done", stderr=""
+    @staticmethod
+    def _fake_proc(stdout_lines, stderr_text="", returncode=0):
+        proc = MagicMock()
+        proc.stdout = iter(stdout_lines)
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = stderr_text
+        proc.wait.return_value = returncode
+        proc.returncode = returncode
+        return proc
+
+    @patch("app.claude_step.popen_cli")
+    def test_success(self, mock_popen):
+        mock_popen.return_value = (
+            self._fake_proc(["Done\n"], returncode=0), lambda: None,
         )
         result = _run_claude(["claude", "-p", "test"], "/tmp")
         assert result["success"] is True
         assert result["output"] == "Done"
 
-    @patch("app.claude_step.subprocess.run")
-    def test_failure(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr="error"
+    @patch("app.claude_step.popen_cli")
+    def test_failure(self, mock_popen):
+        mock_popen.return_value = (
+            self._fake_proc([], stderr_text="error", returncode=1),
+            lambda: None,
         )
         result = _run_claude(["claude", "-p", "test"], "/tmp")
         assert result["success"] is False
         assert "Exit code 1" in result["error"]
 
-    @patch("app.claude_step.subprocess.run")
-    def test_timeout(self, mock_run):
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
-        result = _run_claude(["claude", "-p", "test"], "/tmp", timeout=10)
+    @patch("app.claude_step.popen_cli")
+    def test_timeout(self, mock_popen):
+        """Watchdog firing must convert to a Timeout error result."""
+        proc = MagicMock()
+        kill_event = threading.Event()
+
+        def hanging_iter():
+            kill_event.wait(timeout=2)
+            return
+            yield  # makes generator
+
+        proc.stdout = hanging_iter()
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = ""
+        proc.wait.return_value = -9
+        proc.returncode = -9
+        proc.pid = os.getpid()
+        proc.kill.side_effect = lambda: kill_event.set()
+        mock_popen.return_value = (proc, lambda: None)
+
+        with patch("app.claude_step.os.killpg", side_effect=lambda *a: kill_event.set()):
+            result = _run_claude(["claude", "-p", "test"], "/tmp", timeout=1)
+
         assert result["success"] is False
         assert "Timeout" in result["error"]
 
